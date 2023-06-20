@@ -42,6 +42,7 @@ Results
 from .numpy_eigensolver import NumPyEigensolver, NumPyEigensolverResult
 from .eigensolver import Eigensolver, EigensolverResult
 from .vqd import VQD, VQDResult
+from .vqse import VQSE, VQSEResult
 
 __all__ = [
     "NumPyEigensolver",
@@ -50,4 +51,6 @@ __all__ = [
     "EigensolverResult",
     "VQD",
     "VQDResult",
+    "VQSE",
+    "VQSEResult",
 ]

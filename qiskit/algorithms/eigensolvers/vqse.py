@@ -68,8 +68,6 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         self.callback = callback
 
         self.adaptive = adaptive 
-        
-        self._err = []
 
     @property
     def initial_point(self) -> Sequence[float] | None:
@@ -223,6 +221,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
             nonlocal eval_count
 
             h = self._hamiltonian(f, target, parameters, m)
+
             # handle broadcasting: ensure parameters is of shape [array, array, ...]
             parameters = np.reshape(parameters, (-1, num_parameters)).tolist()
             batch_size = len(parameters)
@@ -242,18 +241,6 @@ class VQSE(VariationalAlgorithm, Eigensolver):
                     self.callback(eval_count, params, value, meta)
 
             energy = values[0] if len(values) == 1 else values
-
-            # --- logging error --- #
-            state = DensityMatrix(target)
-            _, est_eigvals = self._estimate_eigenvalues(target, parameters, m)
-            true_eigvals = np.linalg.eigvalsh(state)[-m:]
-
-            #print(f'est: {est_eigvals}')
-            #print(f'true: {true_eigvals}')
-            err = np.sum((est_eigvals - true_eigvals)**2)
-            self._err.append(err)
-            print(f'err: {err}, energy = {energy}')
-            # --------------------- #
 
             return energy
 
@@ -330,8 +317,8 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         parameters: np.ndarray,
         m: int,
     ):
-        circuit = target.compose(ansatz)
-        circuit.measure_all()
+        circuit = target.compose(self.ansatz)
+        circuit.measure_all(add_bits=False)
 
         job = self.sampler.run([circuit], parameters)
         sampler_results = job.result()
@@ -354,50 +341,22 @@ class VQSE(VariationalAlgorithm, Eigensolver):
     ) -> VQSEResult:
         result = VQSEResult()
         
-        result.optimal_circuit = ansatz.copy()
+        assignments = dict(zip(self.ansatz.parameters, optimizer_result.x))
+        result.optimal_circuit = self.ansatz.assign_parameters(assignments)
         
         bitstrings, eigenvalues = self._estimate_eigenvalues(target, optimizer_result.x, m)
-        result.basis_states = bitstrings
+        result.basis_states = [f'{z:0{self.ansatz.num_qubits}b}' for z in bitstrings]
         result.eigenvalues = eigenvalues
         
         result.cost_function_evals = optimizer_result.nfev
+
+        optimal_parameters = dict(zip(self.ansatz.parameters, optimizer_result.x))
+        result.optimal_parameters = optimal_parameters
+        result.optimal_circuit = self.ansatz.assign_parameters(optimal_parameters)
         result.optimal_point = optimizer_result.x
-        result.optimal_parameters = dict(zip(self.ansatz.parameters, optimizer_result.x))
         result.optimal_value = optimizer_result.fun
         result.optimizer_time = optimizer_time
         result.optimizer_result = optimizer_result
         
         return result
 
-
-if __name__ == "__main__":
-    from qiskit.circuit.library import RealAmplitudes
-    from qiskit.quantum_info import Statevector
-    from qiskit.primitives import Estimator, Sampler
-    from qiskit import ClassicalRegister
-    
-    num_qubits = 4
-    target = RealAmplitudes(num_qubits, reps=2)
-    clbit = ClassicalRegister(1)
-    target.add_bits(clbit)
-    target.measure(0,0)
-    assignments = dict(zip(target.parameters, 
-                           np.random.rand(len(target.parameters))*np.pi))
-    
-    target.assign_parameters(assignments, inplace=True)
-
-    ansatz = RealAmplitudes(num_qubits, reps=2)
-    estimator = Estimator()
-    sampler = Sampler()
-    optimizer = ADAM(maxiter=300, amsgrad=True, lr=0.01, beta_1=0.8, beta_2=0.9)    
-    
-    m = 1
-    vqse = VQSE(estimator, sampler, ansatz, optimizer)
-    
-    result = vqse.compute_eigensystem(target, m, f = lambda x: 1)
-    state = DensityMatrix(target)
-    print(result.eigenvalues)
-    print(np.linalg.eigvalsh(state)[-m:])
-    import matplotlib.pyplot as plt
-    #plt.plot(vqse._err)
-    #plt.show()
