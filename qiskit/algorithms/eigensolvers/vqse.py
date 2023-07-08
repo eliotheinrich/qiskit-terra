@@ -1,23 +1,25 @@
-from qiskit import QuantumCircuit
+from __future__ import annotations
+
+from qiskit import QuantumCircuit, ClassicalRegister
 
 import numpy as np
 from qiskit.algorithms.eigensolvers.eigensolver import EigensolverResult
 from qiskit.algorithms.list_or_dict import ListOrDict
 
-from qiskit.primitives import BaseEstimator, BaseSampler
+from qiskit.primitives import BaseSampler
 from qiskit.opflow import PauliSumOp
-from qiskit.quantum_info import SparsePauliOp, DensityMatrix
+from qiskit.quantum_info import DensityMatrix
 
 from qiskit.algorithms import AlgorithmError
 from qiskit.algorithms import VariationalAlgorithm, VariationalResult
 from qiskit.algorithms.optimizers import ADAM, OptimizerResult
-from qiskit.algorithms.gradients import BaseEstimatorGradient
+from qiskit.algorithms.gradients import BaseSamplerGradient
 from qiskit.algorithms.utils import validate_bounds, validate_initial_point
 from qiskit.algorithms.utils.set_batching import _set_default_batchsize
 from qiskit.algorithms.eigensolvers import Eigensolver, EigensolverResult
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Tuple
 from time import time
 
 import logging
@@ -46,19 +48,48 @@ class VQSEResult(VariationalResult, EigensolverResult):
 class VQSE(VariationalAlgorithm, Eigensolver):
     def __init__(
         self, 
-        estimator: BaseEstimator,
         sampler: BaseSampler,
         ansatz: QuantumCircuit,
         optimizer: ADAM,
+        m: int = 1,
         *,
-        adaptive: bool = True,
-        gradient: BaseEstimatorGradient | None = None,
+        q: Sequence[float] | None = None,
+        r: Sequence[float] | None = None,
+        f: Callable[[float], float] = lambda x: x,
+        delta: float = 0.01,
+        adaptive_update_frequency: int = 30,
+        gradient: BaseSamplerGradient | None = None,
         initial_point: Sequence[float] | None = None,
-        callback: Callable[[int, np.ndarray, float, dict[str, Any]], None] | None = None,
+        callback: Callable[[int, np.ndarray, float, dict[str, Any], float], None] | None = None,
+        **estimator_options,
     ):
+        """
+        Args:
+            sampler: The sampler primitive.
+            ansatz: The parametrized circuit used as the ansatz circuit to prepare the state.
+            optimizer: An ADAM optimizer used for the classical minimization of the cost function.
+            m: The number of eigenvalues to compute. Computes the lowest m eigenvalues.
+            q: The sequence of values used in the global Hamiltonian for the VQSE algorithm. Should
+                have length m and be sorted in descending ording.
+            r: The sequence of values used in the local Hamiltonian for the VQSE algorithm. Should
+                have length equal to the number of qubits in the ansatz.
+            f: The function which sets the adiabatic transformation of the Hamiltonian from local to
+                global. Should satisfy f(0) = 0 and f(1) = 1.
+            delta: If no r is provided, the default values of r are set according to this spacing. 
+            adaptive_update_frequency: Sets the frequency with which the VQSE adaptive global hamiltonian
+                is updated. Default is every 30 iterations of the ADAM optimizer.
+            initial_point: The initial point of the parameters in the provided ansatz.
+            callback: A callback that can access the intermediate data
+                during the optimization. Four parameter values are passed to the callback as
+                follows during each evaluation by the optimizer: the evaluation count,
+                the optimizer parameters for the ansatz, the estimated value,
+                the estimation metadata, and the current step.
+            estimator_options: Remaining kwargs are passed as kwargs to the estimator whenever it is 
+                called.
+            
+        """
         super().__init__()
 
-        self.estimator = estimator
         self.sampler = sampler
         self.ansatz = ansatz
         self.optimizer = optimizer
@@ -67,7 +98,32 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         self.initial_point = initial_point
         self.callback = callback
 
-        self.adaptive = adaptive 
+        self._estimator_options = estimator_options
+
+        self.adaptive_update_frequency = adaptive_update_frequency
+        self._measured_bitstrings: Sequence[int] | None = None
+
+        self.m = m
+        self.f = f
+        
+        if q is None:
+            self._q = [1./(i+2) for i in range(m)]
+        else:
+            if len(q) != m:
+                raise AlgorithmError("q much have length equal to m.")
+            self._q = q
+        
+        if r is None:
+            if m == 1:
+                self._r = [1]*self.ansatz.num_qubits
+            else:
+                self._r = [1 + (i - 1)*delta for i in range(self.ansatz.num_qubits)]
+        else:
+            if len(r) != self.ansatz.num_qubits:
+                raise AlgorithmError("r must have length equal to the number of qubits.")
+            self._r = r
+
+
 
     @property
     def initial_point(self) -> Sequence[float] | None:
@@ -79,41 +135,11 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         
     def compute_eigenvalues(
         self, 
-        operator: BaseOperator | PauliSumOp, 
+        target: QuantumCircuit | DensityMatrix, 
         aux_operators: ListOrDict[BaseOperator | PauliSumOp] | None = None
-    ) -> EigensolverResult:
-        
-        return EigensolverResult()
-    
-    def compute_eigensystem(
-        self,
-        target: QuantumCircuit,
-        m: int,
-        f: Callable[[float], float] = lambda x: x,
-        q: Sequence[float] | None = None,
-        r: Sequence[float] | None = None,
-        delta: float = 0.01
     ) -> VQSEResult:
         self._check_target(target)
         
-        if q is None:
-            self.q = [1./(i+2) for i in range(m)]
-        else:
-            if len(q) != m:
-                raise AlgorithmError("q much have length equal to m.")
-            self.q = q
-        
-        if r is None:
-            if m == 1:
-                self.r = [1]*self.ansatz.num_qubits
-            else:
-                self.r = [1 + (i - 1)*delta for i in range(self.ansatz.num_qubits)]
-        else:
-            if len(r) != self.ansatz.num_qubits:
-                raise AlgorithmError("r must have length equal to the number of qubits.")
-            self.r = r
-
-
         # Validate target against ansatz  
         
         initial_point = validate_initial_point(self.initial_point, self.ansatz)
@@ -122,10 +148,10 @@ class VQSE(VariationalAlgorithm, Eigensolver):
          
         start_time = time()
 
-        evaluate_energy = self._get_evaluate_energy(target, f, m)
+        evaluate_energy = self._get_evaluate_energy(target)
 
         if self.gradient is not None:
-            evaluate_gradient = self._get_evaluate_gradient(target, f, m)
+            evaluate_gradient = self._get_evaluate_gradient(target)
         else:
             evaluate_gradient = None
 
@@ -138,7 +164,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
             # we always want to submit as many estimations per job as possible for minimal
             # overhead on the hardware
             was_updated = _set_default_batchsize(self.optimizer)
-
+ 
             optimizer_result = self.optimizer.minimize(
                 fun=evaluate_energy, x0=initial_point, jac=evaluate_gradient, bounds=bounds
             )
@@ -156,14 +182,20 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         )
 
         return self._build_vqse_result(
-            target, m, optimizer_result, optimizer_time
+            target, optimizer_result, optimizer_time
         )
+    
+    
+    def _prepare_circuit(self, target: QuantumCircuit) -> QuantumCircuit:
+        circuit = target.compose(self.ansatz)
+        if circuit.num_qubits > circuit.num_clbits:
+            circuit.add_register(ClassicalRegister(circuit.num_qubits - circuit.num_clbits))
+        circuit.measure_all(add_bits=False)
+        return circuit
         
     def _get_evaluate_gradient(
         self,
-        target: QuantumCircuit,
-        f: Callable[[float], float],
-        m: int,
+        target: QuantumCircuit | DensityMatrix,
     ) -> Callable[[np.ndarray], np.ndarray]:
         """Get a function handle to evaluate the gradient at given parameters for the ansatz.
 
@@ -177,12 +209,12 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         Raises:
             AlgorithmError: If the primitive job to evaluate the gradient fails.
         """
-        circuit = target.compose(self.ansatz)
+        circuit = self._prepare_circuit(target)
 
         def evaluate_gradient(parameters: np.ndarray) -> np.ndarray:
             # broadcasting not required for the estimator gradients
             try:
-                job = self.gradient.run([circuit], [self._hamiltonian(f, target, parameters, m)], [parameters])
+                job = self.gradient.run([circuit], [parameters], **self._estimator_options)
                 gradients = job.result().gradients
             except Exception as exc:
                 raise AlgorithmError("The primitive job to evaluate the gradient failed!") from exc
@@ -193,16 +225,13 @@ class VQSE(VariationalAlgorithm, Eigensolver):
     
     def _get_evaluate_energy(
         self,
-        target: QuantumCircuit,
-        f: Callable[[float], float],
-        m: int,
+        target: QuantumCircuit | DensityMatrix,
     ) -> Callable[[np.ndarray], np.ndarray | float]:
         """Returns a function handle to evaluate the energy at given parameters for the ansatz.
         This is the objective function to be passed to the optimizer that is used for evaluation.
 
         Args:
             ansatz: The ansatz preparing the quantum state.
-            operator: The operator whose energy to evaluate.
 
         Returns:
             A callable that computes and returns the energy of the hamiltonian of each parameter.
@@ -210,88 +239,93 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         Raises:
             AlgorithmError: If the primitive job to evaluate the energy fails.
         """
-        num_parameters = self.ansatz.num_parameters
-
         # avoid creating an instance variable to remain stateless regarding results
         eval_count = 0
-
-        circuit = target.compose(self.ansatz)
 
         def evaluate_energy(parameters: np.ndarray) -> np.ndarray | float:
             nonlocal eval_count
 
-            h = self._hamiltonian(f, target, parameters, m)
+            t = self.optimizer._t/self.optimizer._maxiter
 
             # handle broadcasting: ensure parameters is of shape [array, array, ...]
+            num_parameters = len(self.ansatz.parameters)
             parameters = np.reshape(parameters, (-1, num_parameters)).tolist()
-            batch_size = len(parameters)
 
             try:
-                job = self.estimator.run(batch_size * [circuit], batch_size * [h], parameters)
-                estimator_result = job.result()
+                if isinstance(target, QuantumCircuit):
+                    outcomes, metadata = self._get_counts_from_quantum_circuit(target, parameters)
+                elif isinstance(target, DensityMatrix):
+                    outcomes, metadata = self._get_counts_from_density_matrix(target, parameters)
             except Exception as exc:
                 raise AlgorithmError("The primitive job to evaluate the energy failed!") from exc
 
-            values = estimator_result.values
-
-            if self.callback is not None:
-                metadata = estimator_result.metadata
-                for params, value, meta in zip(parameters, values, metadata):
+            # This might only work with ADAM optimizer; need to keep track of time some other way.
+            t = self.optimizer._t/self.optimizer._maxiter
+            
+            if isinstance(outcomes, list):
+                self._measured_bitstrings = self._compute_bitstrings(outcomes[0])
+                if self.callback is not None:
+                    for param, outcome, meta in zip(parameters, outcomes, metadata):
+                        eval_count += 1
+                        self.callback(eval_count, param, outcome, meta, t)
+                return [self._compute_expected_energy(dist, t) for dist in outcomes]
+            elif isinstance(outcomes, dict):
+                self._measured_bitstrings = self._compute_bitstrings(outcomes)
+                if self.callback is not None:
                     eval_count += 1
-                    self.callback(eval_count, params, value, meta)
-
-            energy = values[0] if len(values) == 1 else values
-
-            return energy
+                    self.callback(eval_count, parameters[0], outcomes, metadata, t)
+                return self._compute_expected_energy(outcomes, t)
 
         return evaluate_energy
-
-    def _global_hamiltonian(
-        self,
-        target: QuantumCircuit,
-        parameters: np.ndarray,
-        m: int
-    ):
-        H = SparsePauliOp.from_list([('I'*self.ansatz.num_qubits, 1)])
-        
-        if self.adaptive:
-            bitstrings, _ = self._estimate_eigenvalues(target, parameters, m)
-        else:
-            bitstrings = list(range(len(self.q)))
-        for q,z in zip(self.q, bitstrings):
-            pauli_ops = []
-            for j in range(1 << self.ansatz.num_qubits):
-                label = f'{j:0{self.ansatz.num_qubits}b}'.replace('0', 'I').replace('1', 'Z')
-
-                amplitude = -q*(-1)**bin(j & z).count('1')/(1 << self.ansatz.num_qubits)
-                pauli_ops.append((label, amplitude))
-
-            H += SparsePauliOp.from_list(pauli_ops) 
-            H = H.simplify()
-            
-        return H
     
-    def _local_hamiltonian(self):
-        pauli_ops = [('I'*self.ansatz.num_qubits, 1)]
-        for i in range(self.ansatz.num_qubits):
-            label = 'I'*i + 'Z' + 'I'*(self.ansatz.num_qubits - i - 1)
-            amplitude = -self.r[i]
-            pauli_ops.append((label, amplitude))
+    def _compute_bitstrings(self,
+        outcomes: dict[int, float],
+    ) -> list[int]:
+        """
+        Computes the bitstrings corresponding to the m most frequent measurements, which
+        are passed as a probabilities dictionary with integer keys.
         
-        H = SparsePauliOp.from_list(pauli_ops)
-        return H
-       
-    def _hamiltonian(
-        self, 
-        f: Callable[[float], float],
-        target: QuantumCircuit,
-        parameters: np.ndarray,
-        m: int,
-    ):
-        t = self.optimizer._t/self.optimizer._maxiter
-        return (1 - f(t))*self._local_hamiltonian() + f(t)*self._global_hamiltonian(target, parameters, m)
+        Args:
+            outcomes: A probability dictionary corresponding to measurement outcomes containing
+                integers as keys and floats as values.
+        
+        Returns:
+            A list of the m most frequently measured bitstrings in outcomes.
+        """
+        sorted_outcomes = sorted(list(outcomes.items()), key=lambda x: x[1])
+        return [x[0] for x in sorted_outcomes[-self.m:]]
+        
+    
+    def _compute_expected_energy(
+        self,
+        outcomes: dict[int, float],
+        t: float,
+    ) -> float:
+        """
+        Computes the expected energy of a given set of measurement outcomes at a given time
+        with respect to the VQSE adaptive hamiltonian.
+        
+        Args:
+            outcomes: A probability dictionary corresponding to measurement outcomes containing
+                integers as keys and floats as values.
+            t: The current timestep.
+        
+        Returns:
+            The expectation of the VQSE hamiltonian with respect to the provided outcomes.
+        """
+        global_energy = 1
+        for i,z in enumerate(self._measured_bitstrings):
+            if z in outcomes: # If not, it has probability 0 and does not contribute
+                global_energy -= self._q[i]*outcomes[z]
+            
+        local_energy = 1
+        for b,p in outcomes.items():
+            for j in range(self.ansatz.num_qubits):
+                local_energy += (2*int((b >> j) & 1) - 1)*self._r[j]*p
+        
+        return (1 - self.f(t))*local_energy + self.f(t)*global_energy
 
-    def _check_target(self, target: QuantumCircuit):
+    def _check_target(self, target: QuantumCircuit | DensityMatrix):
         """Check that the number of qubits of target and ansatz match and that the ansatz is
         parameterized.
         """
@@ -313,38 +347,115 @@ class VQSE(VariationalAlgorithm, Eigensolver):
     
     def _estimate_eigenvalues(
         self, 
-        target: QuantumCircuit,
+        target: QuantumCircuit | DensityMatrix,
         parameters: np.ndarray,
-        m: int,
-    ):
-        circuit = target.compose(self.ansatz)
-        circuit.measure_all(add_bits=False)
-
-        job = self.sampler.run([circuit], parameters)
-        sampler_results = job.result()
+    ) -> Tuple[Sequence[int], Sequence[float]]:
+        """
+        Estimates the eigenvalues of target given a set of parameters to be provided to the ansatz. 
         
-        probs_dict = sampler_results.quasi_dists[0]
+        Args:
+            target: The quantum circuit which produces the desired state or a copy of the DensityMatrix directly.
+            parameters: A list of parameters to be provided to the ansatz.
+        
+        Returns:
+            A tuple where the first element is a list of the m most frequently measured outcomes and
+            the second element is a list containing the corresponding probabilities.
+        """
+        if isinstance(target, QuantumCircuit):
+            probs_dict, _ = self._get_counts_from_quantum_circuit(target, parameters)
+        elif isinstance(target, DensityMatrix):
+            probs_dict, _ = self._get_counts_from_density_matrix(target, parameters)
+        
         [*bitstrings], [*probs] = zip(*probs_dict.items())
         bitstrings = np.array(bitstrings)
         probs = np.array(probs)
         
         inds = np.argsort(probs)
-        bitstrings, eigenvalues = bitstrings[inds[-m:]], probs[inds[-m:]]
+        bitstrings, eigenvalues = bitstrings[inds[-self.m:]], probs[inds[-self.m:]]
         return bitstrings, eigenvalues
+    
+    def _get_counts_from_density_matrix(self, 
+        target: DensityMatrix, 
+        parameters: np.ndarray
+    ) -> Tuple[Sequence[dict[int, float]], Sequence[dict[str, Any]]] | Tuple[dict[int, float], dict[str, Any]]:
+        """
+        Returns measurement counts when the target is a density matrix.
+        
+            Args:
+                target: The target, which is a DensityMatrix.
+                parameters: The parameters to be passed to the ansatz circuit. Can be either a 1d array of
+                    parameters or a list of 1d parameters.
+                
+            Returns:
+                If one set of parameters is passed, return a pair of dictionaries, where the first element is
+                the measurement outcomes and the second element is metadata. 
+                
+                If multiple sets of parameters are passed, a list of dictionary pairs containing measurement
+                outcomes and metadata for each set of parameters is returned.
+        """
+        if not isinstance(parameters[0], list):
+            parameters = [parameters]
+        outcomes = []
+        metadata = []
+        for params in parameters:
+            assignments = dict(zip(self.ansatz.parameters, params))
+            result = target.evolve(self.ansatz.assign_parameters(assignments)).probabilities()
+            outcomes.append({i: result[i] for i in range(len(result))})
+            metadata.append({})
+        
+        if len(outcomes) > 1:
+            return outcomes, metadata
+        else:
+            return outcomes[0], metadata[0]
+    
+    def _get_counts_from_quantum_circuit(self, 
+        target: QuantumCircuit, 
+        parameters: np.ndarray
+    ) -> Tuple[Sequence[dict[int, float]], Sequence[dict[str, Any]]] | Tuple[dict[int, float], dict[str, Any]]:
+        """
+        Returns measurement counts when the target is a quantum circuit.
+        
+            Args:
+                target: The target, which is a QuantumCircuit.
+                parameters: The parameters to be passed to the ansatz circuit. Can be either a 1d array of
+                    parameters or a list of 1d parameters.
+                
+            Returns:
+                If one set of parameters is passed, return a pair of dictionaries, where the first element is
+                the measurement outcomes and the second element is metadata. 
+                
+                If multiple sets of parameters are passed, a list of dictionary pairs containing measurement
+                outcomes and metadata for each set of parameters is returned.
+        """
+        if len(np.shape(parameters)) > 1:
+            batch_size = len(parameters)
+        else:
+            batch_size = 1
+
+        circuit = self._prepare_circuit(target)
+        job = self.sampler.run(batch_size * [circuit], parameters, **self._estimator_options)
+        sampler_result = job.result()
+        if len(sampler_result.quasi_dists) > 1:
+            return sampler_result.quasi_dists, sampler_result.metadata
+        else:
+            return sampler_result.quasi_dists[0], sampler_result.metadata[0]
+
     
     def _build_vqse_result(
         self,
-        target: QuantumCircuit,
-        m: int,
+        target: QuantumCircuit | QuantumCircuit,
         optimizer_result: OptimizerResult,
         optimizer_time: float,
     ) -> VQSEResult:
+        """
+        Builds the VQSEResult to be returned.
+        """
         result = VQSEResult()
         
         assignments = dict(zip(self.ansatz.parameters, optimizer_result.x))
         result.optimal_circuit = self.ansatz.assign_parameters(assignments)
         
-        bitstrings, eigenvalues = self._estimate_eigenvalues(target, optimizer_result.x, m)
+        bitstrings, eigenvalues = self._estimate_eigenvalues(target, optimizer_result.x)
         result.basis_states = [f'{z:0{self.ansatz.num_qubits}b}' for z in bitstrings]
         result.eigenvalues = eigenvalues
         
@@ -360,3 +471,79 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         
         return result
 
+if __name__ == '__main__':
+    from qiskit.circuit.library import RealAmplitudes
+    from qiskit_aer.primitives import Sampler
+    from qiskit.algorithms.optimizers import ADAM
+
+    from qiskit import QuantumCircuit, Aer, execute
+    sim = Aer.get_backend('aer_simulator')
+
+    import numpy  as np
+
+    sampler = Sampler()
+    optimizer = ADAM(maxiter=200, amsgrad=True, lr=0.01, beta_1=0.8, beta_2=0.9)
+
+    num_qubits = 2
+
+    ansatz_circuit = RealAmplitudes(num_qubits, reps=2)
+
+    m = 1
+    vqse = VQSE(
+        sampler,
+        ansatz_circuit,
+        optimizer,
+        #adaptive_update_frequency=0,
+        m=1,
+        shots=4*1024
+    )
+
+
+
+    target = RealAmplitudes(num_qubits, reps=2)
+    target.add_register(ClassicalRegister(1))
+    target.measure(0, 0)
+    assignments = dict(zip(target.parameters, 2*np.pi*np.random.rand(len(target.parameters))))
+    target = target.assign_parameters(assignments)
+
+    qc = QuantumCircuit(num_qubits, 1)
+    qc = qc.compose(target)
+    qc.save_density_matrix()
+
+    result = execute(qc, sim).result()
+    density_target = result.data()['density_matrix']
+
+    true_eigenvals = np.linalg.eigvalsh(density_target)[-m:]
+
+    target = density_target
+
+    abs_err = []
+    rel_err = []
+    values = []
+    def callback(eval_count, params, value, metadata, t):
+        global abs_err, rel_err, true_eigenvals
+        _, est_eigenvals = vqse._estimate_eigenvalues(target, params)
+        
+        aerr = np.sum((true_eigenvals - est_eigenvals)**2)
+        rerr = np.sum(((true_eigenvals - est_eigenvals)/true_eigenvals)**2)
+        
+        abs_err.append(aerr)
+        rel_err.append(rerr)
+        values.append(value)
+        
+
+    vqse.callback = callback
+
+
+
+    result = vqse.compute_eigenvalues(target)
+    print(result)
+    print(true_eigenvals)
+    print(result.eigenvalues)
+    
+    import matplotlib.pyplot as plt
+    plt.plot(abs_err, label=r'$\epsilon_\lambda$')
+    plt.plot(rel_err, label=r'$\epsilon_r$')
+    plt.yscale('log')
+    plt.legend(fontsize=14)
+    plt.show()
