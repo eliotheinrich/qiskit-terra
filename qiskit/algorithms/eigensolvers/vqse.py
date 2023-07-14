@@ -56,12 +56,12 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         q: Sequence[float] | None = None,
         r: Sequence[float] | None = None,
         f: Callable[[float], float] = lambda x: x,
-        delta: float = 0.01,
+        delta: float | None = 0.01,
         adaptive_update_frequency: int = 30,
         gradient: BaseSamplerGradient | None = None,
         initial_point: Sequence[float] | None = None,
         callback: Callable[[int, np.ndarray, float, dict[str, Any], float], None] | None = None,
-        **estimator_options,
+        **sampler_options,
     ):
         """
         Args:
@@ -84,7 +84,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
                 follows during each evaluation by the optimizer: the evaluation count,
                 the optimizer parameters for the ansatz, the estimated value,
                 the estimation metadata, and the current step.
-            estimator_options: Remaining kwargs are passed as kwargs to the estimator whenever it is 
+            sampler_options: Remaining kwargs are passed as kwargs to the sampler whenever it is 
                 called.
             
         """
@@ -98,30 +98,55 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         self.initial_point = initial_point
         self.callback = callback
 
-        self._estimator_options = estimator_options
+        self._sampler_options = sampler_options
 
         self.adaptive_update_frequency = adaptive_update_frequency
-        self._measured_bitstrings: Sequence[int] | None = None
+        self._measured_bitstrings: Sequence[int] = list(range(m))
 
         self.m = m
         self.f = f
         
+        num_qubits = self.ansatz.num_qubits
+        
+        if delta is None:
+            delta = 1/(2.*m)
+        
+        if r is None:
+            if m == 1:
+                self._r = [1]*num_qubits
+            else:
+                self._r = [1 + i*delta for i in range(num_qubits)]
+        else:
+            if len(r) != num_qubits:
+                raise AlgorithmError("r must have length equal to the number of qubits.")
+            self._r = r
+
         if q is None:
-            self._q = [1./(i+2) for i in range(m)]
+            self._q = []
+            
+            import itertools
+
+            i = 0
+            k = 0
+            while i < m:
+                for comb in itertools.combinations(range(num_qubits), k):
+                    bitstring = 0
+                    for q in comb:
+                        bitstring = (1 << q) | bitstring
+                    
+                    i += 1
+                    energy = 1
+                    for j in range(num_qubits):
+                        energy += (2*int((bitstring >> j) & 1) - 1)*self._r[j]
+
+                    self._q.append(1 -  energy)
+
+                k += 1
         else:
             if len(q) != m:
                 raise AlgorithmError("q much have length equal to m.")
             self._q = q
         
-        if r is None:
-            if m == 1:
-                self._r = [1]*self.ansatz.num_qubits
-            else:
-                self._r = [1 + (i - 1)*delta for i in range(self.ansatz.num_qubits)]
-        else:
-            if len(r) != self.ansatz.num_qubits:
-                raise AlgorithmError("r must have length equal to the number of qubits.")
-            self._r = r
 
 
 
@@ -161,7 +186,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
                 fun=evaluate_energy, x0=initial_point, jac=evaluate_gradient, bounds=bounds
             )
         else:
-            # we always want to submit as many estimations per job as possible for minimal
+            # we always want to submit as many samples per job as possible for minimal
             # overhead on the hardware
             was_updated = _set_default_batchsize(self.optimizer)
  
@@ -214,7 +239,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         def evaluate_gradient(parameters: np.ndarray) -> np.ndarray:
             # broadcasting not required for the estimator gradients
             try:
-                job = self.gradient.run([circuit], [parameters], **self._estimator_options)
+                job = self.gradient.run([circuit], [parameters], **self._sampler_options)
                 gradients = job.result().gradients
             except Exception as exc:
                 raise AlgorithmError("The primitive job to evaluate the gradient failed!") from exc
@@ -294,7 +319,6 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         """
         sorted_outcomes = sorted(list(outcomes.items()), key=lambda x: x[1])
         return [x[0] for x in sorted_outcomes[-self.m:]]
-        
     
     def _compute_expected_energy(
         self,
@@ -413,8 +437,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
         parameters: np.ndarray
     ) -> Tuple[Sequence[dict[int, float]], Sequence[dict[str, Any]]] | Tuple[dict[int, float], dict[str, Any]]:
         """
-        Returns measurement counts when the target is a quantum circuit.
-        
+        Returns measurement counts when the target is a quantum circuit. 
             Args:
                 target: The target, which is a QuantumCircuit.
                 parameters: The parameters to be passed to the ansatz circuit. Can be either a 1d array of
@@ -433,7 +456,7 @@ class VQSE(VariationalAlgorithm, Eigensolver):
             batch_size = 1
 
         circuit = self._prepare_circuit(target)
-        job = self.sampler.run(batch_size * [circuit], parameters, **self._estimator_options)
+        job = self.sampler.run(batch_size * [circuit], parameters, **self._sampler_options)
         sampler_result = job.result()
         if len(sampler_result.quasi_dists) > 1:
             return sampler_result.quasi_dists, sampler_result.metadata
